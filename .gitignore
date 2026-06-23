@@ -1,0 +1,23 @@
+# R / RStudio
+.Rhistory
+.Rdata
+.httr-oauth
+.DS_Store
+*.Rproj.user/
+
+# knitr / rmarkdown cache & output
+*_cache/
+*_files/
+*.pdf
+*.html
+*.log
+*.aux
+*.out
+
+# Generated results directory (re-created by running the .Rmd)
+lgg_results/
+
+# macOS
+.DS_Store
+.Spotlight-V100
+.Trashes

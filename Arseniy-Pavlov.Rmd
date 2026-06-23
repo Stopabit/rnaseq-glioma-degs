@@ -1,0 +1,393 @@
+---
+title: "Differential expression between glioma RNA-expression clusters LGr4 and LGr3"
+subtitle: "TCGA lower-grade glioma (LGG) — NGS practical lab"
+author: "Safin Artur and Arseniy Pavlov"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  pdf_document:
+    toc: false
+    number_sections: true
+    fig_caption: true
+    df_print: kable
+    latex_engine: pdflatex
+fontsize: 11pt
+geometry: "a4paper, margin=2.3cm"
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+---
+
+```{r setup, include=FALSE}
+# global knit options. echo on so the report shows the code we actually ran;
+# warnings/messages off because Bioconductor pkgs are *very* chatty on load.
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  cache = TRUE,            # heavy steps (DESeq, GSEA) get cached -> fast re-knits
+  fig.align = "center", fig.width = 7, fig.height = 5, dpi = 150
+)
+set.seed(42)   # GSEA permutations + anything stochastic -> keep it reproducible
+```
+
+```{r install, cache=FALSE}
+# one-time setup: install whatever's missing, then we load it in the next chunk.
+# CRAN stuff via install.packages, Bioconductor stuff via BiocManager. safe to re-run.
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# ggridges is only used by the GSEA ridgeplot
+cran_pkgs <- c("ggplot2", "ggrepel", "pheatmap", "dplyr", "ggridges")
+bioc_pkgs <- c("SummarizedExperiment", "DESeq2", "clusterProfiler",
+               "enrichplot", "org.Hs.eg.db")
+
+missing <- function(p) p[!vapply(p, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing(cran_pkgs))) install.packages(missing(cran_pkgs))
+if (length(missing(bioc_pkgs))) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  BiocManager::install(missing(bioc_pkgs), update = FALSE, ask = FALSE)
+}
+
+# knitting to PDF needs a LaTeX engine. tinytex is the light, self-installing option;
+# this grabs it once if there's no TeX around. wrapped in try() so a knit to HTML (or a box
+# that already has TeX) never dies here.
+if (!requireNamespace("tinytex", quietly = TRUE)) try(install.packages("tinytex"))
+if (requireNamespace("tinytex", quietly = TRUE) &&
+    !tinytex::is_tinytex() && !nzchar(Sys.which("xelatex"))) {
+  try(tinytex::install_tinytex())
+}
+```
+
+```{r libs, cache=FALSE}
+# the stack we lean on. SummarizedExperiment rides in with the .rds anyway.
+suppressPackageStartupMessages({
+  library(SummarizedExperiment)
+  library(DESeq2)
+  library(ggplot2)
+  library(ggrepel)        # non-overlapping gene labels on the volcano
+  library(pheatmap)
+  library(clusterProfiler)
+  library(enrichplot)     # dotplot / ridgeplot for the enrichment objects
+  library(org.Hs.eg.db)   # human annotation -> GO + symbol/entrez mapping
+  library(dplyr)
+})
+
+theme_set(theme_bw(base_size = 11))
+outdir <- "lgg_results"; dir.create(outdir, showWarnings = FALSE)  # everything lands here
+```
+
+# Aim
+
+We re-analyse the TCGA lower-grade glioma (LGG) RNA-seq cohort and contrast the two
+pan-glioma expression clusters defined by Ceccarelli et al. (Cell 2016): **LGr3** vs
+**LGr4**. LGr3 is dominated by *IDH*-mutant lower-grade tumours, whereas LGr4 collects
+the *IDH*-wild-type, GBM-like samples — so the comparison is essentially a molecular
+proxy for the LGG -> GBM axis. Pipeline: `DESeq2` for the differential test, then
+`clusterProfiler` for GO over-representation (ORA) and GSEA.
+
+**Added value.** The practical sessions built the differential test on the edgeR-based
+`TCGAanalyze_DEA` and ran enrichment through DAVID. As our added-value contribution we instead
+run the whole DE step with **DESeq2** and the enrichment with **clusterProfiler**, including a
+rank-based **GSEA** (`gseGO`) on top of the over-representation test. DESeq2 models counts with a
+negative binomial and shrinks the per-gene dispersions, which keeps it robust with the unequal
+group sizes we have here; GSEA complements ORA by scoring the *whole* ranked gene list rather
+than a hard-thresholded subset.
+
+# Experimental design
+
+The data come from The Cancer Genome Atlas (TCGA) diffuse-glioma project (Ceccarelli et al.,
+2016). Tumour material was obtained at surgical resection; total RNA was extracted, poly-A
+selected to enrich mRNA, and sequenced on the Illumina HiSeq platform (the TCGA
+`IlluminaHiSeq_RNASeqV2` pipeline). We start from gene-level **raw counts** (processing level 3)
+pulled with `TCGAbiolinks` and stored in `lgg.rds`, and restrict the analysis to the
+lower-grade-glioma (LGG) cohort, keeping the two pan-glioma RNA-expression clusters of interest
+(LGr3, n = 228; LGr4, n = 77).
+
+**Library size.** The total counts per sample (the sequencing library size) are summarised in the
+boxplot below: depth is fairly even across the two groups, so library size alone should not drive
+the contrast, and DESeq2's size factors absorb the residual differences.
+
+**MIAME / MINSEQE compliance.** MIAME is the minimum-information standard for microarray
+experiments; its sequencing counterpart is MINSEQE. The paper's Materials and Methods, together
+with the public GDC deposition, cover what these standards ask for: the experimental design and
+the clinical/sample annotations, the sequencing platform and library protocol, the data-processing
+and normalisation steps, and open access to both the raw and the processed data. On that basis the
+study meets the MIAME/MINSEQE minimum-information criteria.
+
+# Data and pre-processing
+
+```{r load}
+# the SummarizedExperiment from TCGAbiolinks::GDCprepare(), saved as .RData (ships in the zip).
+# pick up whatever .RData sits next to this Rmd; load() drops the object `se` into the session.
+rdata <- list.files(pattern = "\\.RData$")[1]
+load(rdata)
+
+# the cluster label lives in colData under this (long) paper_* column.
+clu_col <- "paper_Pan.Glioma.RNA.Expression.Cluster"
+stopifnot(clu_col %in% colnames(colData(se)))
+
+# keep just the 2 groups we compare; drop everything else (LGr1/LGr2/NA).
+keep_samples <- colData(se)[[clu_col]] %in% c("LGr3", "LGr4")
+se <- se[, keep_samples]
+
+# LGr3 first = reference level -> a +ve log2FC then means "up in LGr4". matches the paper's
+# low->high grade reading nicely.
+se$cluster <- factor(as.character(colData(se)[[clu_col]]), levels = c("LGr3", "LGr4"))
+table(se$cluster)   # quick sanity check on group sizes
+```
+
+```{r dds}
+# this SE ships two assays: raw_count + normalized_count. DESeq needs the raw integer
+# counts, so grab raw_count explicitly (fall back to the 1st assay just in case).
+cts <- if ("raw_count" %in% assayNames(se)) assays(se)[["raw_count"]] else assay(se)
+cts <- round(as.matrix(cts))          # DESeq wants integers, no funny business
+
+dds <- DESeqDataSetFromMatrix(
+  countData = cts,
+  colData   = as.data.frame(colData(se)),
+  design    = ~ cluster
+)
+
+# carry gene symbols along so we don't have to map Ensembl IDs by hand later.
+# rowData from TCGAbiolinks has gene_id (versioned) + gene_name.
+rowData(dds)$gene_name <- rowData(se)$gene_name
+
+# pre-filter: gene must have >=10 reads in at least as many samples as the smaller group.
+# kills the long tail of all-zero genes -> faster + better dispersion fits.
+smallest_grp <- min(table(dds$cluster))
+dds <- dds[rowSums(counts(dds) >= 10) >= smallest_grp, ]
+nrow(dds)   # genes left after filtering
+```
+
+A quick look at library size (total counts per sample) before we go further — this is the
+"library size" the brief asks about, and a sanity check that no group is sequenced much deeper
+than the other.
+
+```{r libsize, fig.height=3, fig.cap="RNA-seq library size (total counts per sample), by cluster."}
+libsize <- data.frame(cluster = se$cluster, lib = colSums(cts) / 1e6)  # counts in millions
+summary(libsize$lib)
+ggplot(libsize, aes(cluster, lib, fill = cluster)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.6) +
+  scale_fill_manual(values = c(LGr3 = "#377eb8", LGr4 = "#e41a1c")) +
+  labs(x = NULL, y = "Library size (million counts)") +
+  theme(legend.position = "none")
+```
+
+# Differential expression (DESeq2)
+
+DESeq2 models raw counts with a negative-binomial distribution, estimates a size factor per
+sample (to correct for sequencing depth) and a dispersion per gene (to capture biological
+variability), then tests each gene with a Wald test. We don't normalise by hand: feeding raw
+counts is exactly what the model expects. With LGr3 as the reference, a positive log2FC means
+the gene is higher in LGr4.
+
+```{r deseq}
+dds <- DESeq(dds)                                  # size factors + dispersions + Wald test
+res <- results(dds, contrast = c("cluster", "LGr4", "LGr3"), alpha = 0.05)
+
+# tidy table: attach IDs + a readable significance flag.
+res_df <- as.data.frame(res)
+res_df$gene_id   <- rownames(res_df)
+res_df$gene_name <- rowData(dds)$gene_name[match(res_df$gene_id, rownames(dds))]
+
+# our calling rule: padj < 0.05 AND |log2FC| > 1 (i.e. >2x). same thresholds as the report.
+res_df$sig <- "NS"
+res_df$sig[res_df$padj < 0.05 & res_df$log2FoldChange >  1] <- "UP in LGr4"
+res_df$sig[res_df$padj < 0.05 & res_df$log2FoldChange < -1] <- "UP in LGr3"
+res_df <- res_df[order(res_df$padj), ]
+
+table(res_df$sig)
+write.csv(res_df, file.path(outdir, "DEG_LGr4_vs_LGr3.csv"), row.names = FALSE)
+```
+
+```{r deg-summary}
+# little summary table for the report
+data.frame(
+  Metric = c("Genes tested", "padj < 0.05", "UP in LGr4 (FC>2)", "UP in LGr3 (FC>2)"),
+  Value  = c(nrow(res_df),
+             sum(res_df$padj < 0.05, na.rm = TRUE),
+             sum(res_df$sig == "UP in LGr4"),
+             sum(res_df$sig == "UP in LGr3"))
+)
+```
+
+Plenty of genes move, and the split is lopsided towards LGr4 — which fits the idea that the
+IDH-wild-type / high-grade side runs a broader transcriptional programme than the quieter
+IDH-mutant LGr3 tumours.
+
+## Volcano plot
+
+```{r volcano, fig.cap="Volcano plot, LGr4 vs LGr3. Coloured points are significant (padj below 0.05 and at least a two-fold change)."}
+lab <- res_df %>% filter(sig != "NS") %>% slice_min(padj, n = 25)  # only label the headliners
+
+p_volc <- ggplot(res_df, aes(log2FoldChange, -log10(padj), colour = sig)) +
+  geom_point(size = 0.7, alpha = 0.6) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_text_repel(data = lab, aes(label = gene_name), size = 2.6, max.overlaps = 20) +
+  scale_colour_manual(values = c("NS" = "grey75", "UP in LGr3" = "#377eb8",
+                                 "UP in LGr4" = "#e41a1c")) +
+  labs(title = "Differential Expression: LGr4 vs LGr3",
+       subtitle = "padj < 0.05 & |log2FC| > 1",
+       x = "log2 Fold Change (LGr4 / LGr3)", y = "-log10(adjusted p-value)",
+       colour = NULL)
+ggsave(file.path(outdir, "01_volcano.png"), p_volc, width = 8, height = 6, dpi = 150)
+p_volc
+```
+
+## MA plot
+
+```{r ma, fig.cap="MA plot. Mean expression vs log2FC; dashed lines at +/-1."}
+p_ma <- ggplot(res_df, aes(log10(baseMean + 1), log2FoldChange, colour = sig)) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed") +
+  scale_colour_manual(values = c("NS" = "grey75", "UP in LGr3" = "#377eb8",
+                                 "UP in LGr4" = "#e41a1c")) +
+  labs(title = "MA plot - LGr4 vs LGr3",
+       x = "log10(mean expression + 1)", y = "log2 Fold Change", colour = NULL)
+ggsave(file.path(outdir, "07_MA_plot.png"), p_ma, width = 6, height = 4.5, dpi = 150)
+p_ma
+```
+
+# Sample structure
+
+```{r vst}
+# VST for the viz steps (PCA/heatmap). blind=FALSE since we already know the design.
+vsd <- vst(dds, blind = FALSE)
+```
+
+## PCA
+
+```{r pca, fig.cap="PCA on VST-normalised counts. Ellipses = 95% per cluster."}
+pca_df <- plotPCA(vsd, intgroup = "cluster", returnData = TRUE)
+pv <- round(100 * attr(pca_df, "percentVar"))
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, colour = cluster)) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  stat_ellipse(level = 0.95) +
+  scale_colour_manual(values = c("LGr3" = "#377eb8", "LGr4" = "#e41a1c")) +
+  labs(title = "PCA - LGr3 vs LGr4 (VST-normalized)",
+       x = paste0("PC1: ", pv[1], "% variance"),
+       y = paste0("PC2: ", pv[2], "% variance"), colour = "Cluster")
+ggsave(file.path(outdir, "02_pca.png"), p_pca, width = 6, height = 5, dpi = 150)
+p_pca
+```
+
+## Heatmap of the top 50 DEGs
+
+```{r heatmap, fig.width=7, fig.height=8, fig.cap="Top-50 DEGs (by padj), z-scored VST values."}
+top50 <- head(res_df$gene_id[res_df$sig != "NS"], 50)
+mat <- assay(vsd)[top50, ]
+mat <- t(scale(t(mat)))                                  # row z-scores
+rownames(mat) <- rowData(dds)$gene_name[match(top50, rownames(dds))]
+
+ann <- data.frame(Cluster = dds$cluster); rownames(ann) <- colnames(mat)
+# silent=TRUE -> pheatmap hands back the grob instead of drawing; we then save a copy
+# and draw it inline. (more robust across devices than png()+include_graphics.)
+ph <- pheatmap(mat, annotation_col = ann, show_colnames = FALSE,
+               color = colorRampPalette(c("#2166ac", "white", "#b2182b"))(50),
+               main = "Top 50 DEGs - LGr4 vs LGr3 (z-score)",
+               annotation_colors = list(Cluster = c(LGr3 = "#377eb8", LGr4 = "#e41a1c")),
+               silent = TRUE)
+ggsave(file.path(outdir, "03_heatmap_top50.png"), ph$gtable, width = 8, height = 9.5, dpi = 150)
+grid::grid.newpage(); grid::grid.draw(ph$gtable)
+```
+
+# Functional analysis
+
+A gene list on its own is hard to read, so we summarise it two ways. **ORA** asks whether our
+significant DEGs are over-represented in any GO term relative to a background (here, the genes
+we actually tested). **GSEA** skips the hard cut-off and instead walks down the whole list
+ranked by the test statistic, checking whether each GO set clumps at the top or bottom. They
+answer slightly different questions, so it's reassuring when they agree.
+
+## GO over-representation (ORA)
+
+```{r go-ora}
+# universe = every gene we actually tested (don't use the whole genome, it inflates things).
+universe <- unique(na.omit(res_df$gene_name))
+up4 <- unique(na.omit(res_df$gene_name[res_df$sig == "UP in LGr4"]))
+up3 <- unique(na.omit(res_df$gene_name[res_df$sig == "UP in LGr3"]))
+
+go_bp <- function(genes) {
+  enrichGO(gene = genes, universe = universe, OrgDb = org.Hs.eg.db,
+           keyType = "SYMBOL", ont = "BP", pAdjustMethod = "BH",
+           pvalueCutoff = 0.05, qvalueCutoff = 0.05, readable = FALSE)
+}
+ego4 <- go_bp(up4)   # what's turned on in the aggressive LGr4 side
+ego3 <- go_bp(up3)   # ...and in the IDHmut LGr3 side
+
+write.csv(as.data.frame(ego4), file.path(outdir, "GO_BP_upLGr4.csv"), row.names = FALSE)
+write.csv(as.data.frame(ego3), file.path(outdir, "GO_BP_upLGr3.csv"), row.names = FALSE)
+```
+
+```{r go-plots, fig.height=6, fig.cap="GO BP enrichment (top 20 terms) for each direction."}
+d4 <- dotplot(ego4, showCategory = 20) + ggtitle("GO BP - Upregulated in LGr4")
+d3 <- dotplot(ego3, showCategory = 20) + ggtitle("GO BP - Upregulated in LGr3")
+ggsave(file.path(outdir, "04a_GO_BP_upLGr4.png"), d4, width = 7, height = 6, dpi = 150)
+ggsave(file.path(outdir, "04b_GO_BP_upLGr3.png"), d3, width = 7, height = 6, dpi = 150)
+d4; d3
+```
+
+## GSEA
+
+```{r gsea}
+# fgsea's default multicore backend chokes inside knitr (SIGPIPE / env subassignment errors),
+# so pin it to serial. bit slower, but deterministic with the seed and it actually finishes.
+BiocParallel::register(BiocParallel::SerialParam())
+
+# GSEA wants ALL genes ranked, not just the significant ones. rank by the Wald stat
+# (sign = direction, magnitude = confidence). map symbols -> entrez for gseGO.
+rank_df <- res_df %>% filter(!is.na(stat), !is.na(gene_name))
+map <- bitr(rank_df$gene_name, "SYMBOL", "ENTREZID", org.Hs.eg.db) %>%
+       distinct(SYMBOL, .keep_all = TRUE)
+rank_df <- inner_join(rank_df, map, by = c("gene_name" = "SYMBOL"))
+
+geneList <- rank_df$stat
+names(geneList) <- rank_df$ENTREZID
+geneList <- sort(geneList, decreasing = TRUE)      # gseGO needs it sorted, high -> low
+
+gse <- gseGO(geneList = geneList, OrgDb = org.Hs.eg.db, ont = "BP",
+             keyType = "ENTREZID", pvalueCutoff = 0.05,
+             pAdjustMethod = "BH", verbose = FALSE, eps = 0)
+write.csv(as.data.frame(gse), file.path(outdir, "GSEA_GO_BP.csv"), row.names = FALSE)
+```
+
+```{r gsea-plots, fig.height=8, fig.cap="GSEA: dotplot split by direction, and ridgeplot."}
+# the GO term labels on the left are long, so shrink that axis text + give the plots a bit
+# more height so they don't pile on top of each other.
+small_y <- theme(axis.text.y = element_text(size = 6))
+
+g_dot <- dotplot(gse, showCategory = 20, split = ".sign") +
+  facet_grid(. ~ .sign) + ggtitle("GSEA GO BP - LGr4 vs LGr3") + small_y
+g_ridge <- ridgeplot(gse, showCategory = 20) +
+  ggtitle("GSEA Ridgeplot - LGr4 vs LGr3") + small_y
+ggsave(file.path(outdir, "05_GSEA_GO_BP.png"), g_dot, width = 9, height = 8.5, dpi = 150)
+ggsave(file.path(outdir, "06_GSEA_ridgeplot.png"), g_ridge, width = 7, height = 7.5, dpi = 150)
+g_dot; g_ridge
+```
+
+# Biological interpretation
+
+The split lines up with what Ceccarelli et al. describe for the LGG -> GBM axis. **LGr4**
+(the *IDH*-wild-type / GBM-like cluster) is dominated by extracellular-matrix organisation,
+angiogenesis and an immune/inflammatory component, plus a strong ciliary / microtubule-motility
+signature — i.e. the mesenchymal, invasive programme of high-grade disease. **LGr3** (mostly
+*IDH*-mutant lower-grade tumours) keeps a neuronal identity: axon development and guidance,
+synaptic transmission and CNS neuron differentiation come up on top. So progression towards
+GBM looks like a trade of neuronal differentiation for proliferation/ECM/angiogenesis — exactly
+the pattern the original paper reports.
+
+# Conclusion
+
+A straightforward DESeq2 + clusterProfiler pipeline is enough to separate the two clusters
+cleanly: around 3,500 genes come out differentially expressed, and the over-representation and
+GSEA analyses tell the same story. LGr4 (IDH-wild-type, GBM-like) runs an extracellular-matrix,
+angiogenesis, immune and ciliary programme, whereas LGr3 (IDH-mutant, lower-grade) keeps a
+neuronal, synaptic identity. The LGr3 -> LGr4 contrast therefore recapitulates the lower- to
+high-grade progression of diffuse glioma reported by Ceccarelli et al. — reassuring, given we
+reached it from raw counts on a single cohort.
+
+# Session info
+
+```{r session, cache=FALSE}
+sessionInfo()
+```
